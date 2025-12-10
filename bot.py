@@ -1,11 +1,16 @@
-# bot.py
-# Single-file Webhook bot + Telethon userbot + MongoDB
-# Features: ownership verify, balance, withdraw (admin approve), price admin, support
-# Requirements: aiogram, aiohttp, telethon, pymongo, python-dotenv
+"""
+Complete single-file bot.py
+- Webhook-ready (preferred)
+- Telethon userbot for ownership verification
+- MongoDB for users/withdraws/settings
+- Features: Profile, Balance, Price (admin), Withdraw (admin approve), Support, Verify (ownership)
+- Uses env vars: BOT_TOKEN, API_ID, API_HASH, ADMIN_ID, MONGO_URL, USERBOT_SESSION, CHANNEL_ID, WEBHOOK_URL (opt), PORT (opt)
+"""
 
 import os
 import asyncio
 import datetime
+import logging
 from typing import Optional
 
 from aiohttp import web
@@ -13,7 +18,7 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -24,99 +29,155 @@ from telethon.errors import RPCError
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 
+# -------------------------
+# Logging & load .env
+# -------------------------
+logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
-# --------- ENV ----------
+# -------------------------
+# ENV VARS (as you provided)
+# -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-service.onrender.com/webhook
-PORT = int(os.getenv("PORT", 10000))
-
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH")
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
-MONGO_URL = os.getenv("MONGO_URL")
-USERBOT_SESSION = os.getenv("USERBOT_SESSION")  # StringSession string
-CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 0)  # optional: channel for notifications
+RAW_MONGO_URL = os.getenv("MONGO_URL", "")
+USERBOT_SESSION = os.getenv("USERBOT_SESSION")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 0)
 
-# Minimal checks
-if not BOT_TOKEN or not WEBHOOK_URL or not API_ID or not API_HASH or not MONGO_URL or not USERBOT_SESSION:
-    raise RuntimeError("Missing required ENV vars. Set BOT_TOKEN, WEBHOOK_URL, API_ID, API_HASH, MONGO_URL, USERBOT_SESSION")
+# Optional for webhook mode
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com/webhook
+PORT = int(os.getenv("PORT", 0))        # e.g. 10000
 
-# --------- DB ----------
+# -------------------------
+# Basic validation
+# -------------------------
+missing = []
+for name, v in [
+    ("BOT_TOKEN", BOT_TOKEN),
+    ("API_ID", API_ID),
+    ("API_HASH", API_HASH),
+    ("ADMIN_ID", ADMIN_ID),
+    ("RAW_MONGO_URL", RAW_MONGO_URL),
+    ("USERBOT_SESSION", USERBOT_SESSION),
+]:
+    if not v:
+        missing.append(name)
+if missing:
+    raise RuntimeError(f"Missing required ENV vars: {', '.join(missing)}. Fill them and redeploy.")
+
+# Fix MONGO URL if user provided "srv://..." or skipped scheme
+MONGO_URL = RAW_MONGO_URL.strip()
+if MONGO_URL.startswith("srv://"):
+    MONGO_URL = "mongodb+" + MONGO_URL  # e.g. mongodb+srv://...
+elif not MONGO_URL.startswith("mongodb://") and not MONGO_URL.startswith("mongodb+srv://"):
+    # try to be helpful: if they pasted without scheme
+    MONGO_URL = "mongodb+srv://" + MONGO_URL.lstrip("/")
+
+logging.info("Using Mongo URL: %s", MONGO_URL if "@" in MONGO_URL else "mongodb+srv://<hidden>")
+
+# -------------------------
+# MongoDB setup
+# -------------------------
 mongo = MongoClient(MONGO_URL)
 db = mongo.get_database("botydb")
 users_col = db.get_collection("users")
 withdraws_col = db.get_collection("withdraws")
 settings_col = db.get_collection("settings")
 
-# Ensure a default price exists
+# Ensure default price exists (if not set)
 settings_col.update_one({"key": "old_price"}, {"$setOnInsert": {"value": 100}}, upsert=True)
 
-# --------- Bot & Dispatcher (Aiogram Webhook) ----------
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot=bot)
-
-# --------- Telethon userbot ----------
+# -------------------------
+# Telethon userbot setup
+# -------------------------
 userbot = TelegramClient(StringSession(USERBOT_SESSION), API_ID, API_HASH)
 
-# --------- Keyboards ----------
-def main_menu():
-    return types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [types.InlineKeyboardButton("👤 Profile", callback_data="prof")],
-            [types.InlineKeyboardButton("💰 Balance", callback_data="bal")],
-            [types.InlineKeyboardButton("🏷 Price", callback_data="price")],
-            [types.InlineKeyboardButton("📤 Withdraw", callback_data="wd")],
-            [types.InlineKeyboardButton("🆘 Support", callback_data="sup")]
-        ]
-    )
+# -------------------------
+# Aiogram Bot + Dispatcher
+# -------------------------
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher(bot=bot)
 
-def back_button():
-    return types.InlineKeyboardMarkup(
-        inline_keyboard=[[types.InlineKeyboardButton("🔙 Back", callback_data="back")]]
-    )
-
-# ---------- Helpers ----------
+# -------------------------
+# Helpers
+# -------------------------
 def ensure_user(user_id: int):
     users_col.update_one(
         {"user_id": user_id},
-        {"$setOnInsert": {"user_id": user_id, "balance": 0}},
+        {"$setOnInsert": {"user_id": user_id, "balance": 0, "verified_groups": []}},
         upsert=True
     )
 
 def get_price() -> int:
     doc = settings_col.find_one({"key": "old_price"})
-    return int(doc["value"]) if doc and "value" in doc else 0
+    try:
+        return int(doc["value"])
+    except Exception:
+        return 0
 
-# ---------- Handlers ----------
+def set_price(value: int):
+    settings_col.update_one({"key": "old_price"}, {"$set": {"value": int(value)}}, upsert=True)
+
+# Build main menu keyboard (inline)
+def main_menu():
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton("👤 Profile", callback_data="prof")],
+        [types.InlineKeyboardButton("💰 Balance", callback_data="bal")],
+        [types.InlineKeyboardButton("🏷 Price", callback_data="price")],
+        [types.InlineKeyboardButton("📤 Withdraw", callback_data="wd")],
+        [types.InlineKeyboardButton("🆘 Support", callback_data="sup")],
+    ])
+
+def back_button():
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton("🔙 Back", callback_data="back")]
+    ])
+
+# -------------------------
+# Start / Menu
+# -------------------------
 @dp.message(Command("start"))
-async def start_cmd(message: types.Message, **kwargs):
+async def cmd_start(message: types.Message, **kwargs):
     ensure_user(message.from_user.id)
-    await message.answer("Welcome! Use the menu:", reply_markup=main_menu())
+    await message.answer("Welcome! Choose an option:", reply_markup=main_menu())
 
-# Callback: Profile
+# -------------------------
+# Profile callback
+# -------------------------
 @dp.callback_query(lambda c: c.data == "prof")
-async def prof_cb(q: types.CallbackQuery, **kwargs):
+async def cb_profile(q: types.CallbackQuery, **kwargs):
+    ensure_user(q.from_user.id)
     user = users_col.find_one({"user_id": q.from_user.id}) or {}
     balance = user.get("balance", 0)
-    await q.message.edit_text(f"👤 Profile\n\nBalance: `{balance}`", reply_markup=main_menu())
+    verified = len(user.get("verified_groups", []))
+    text = f"👤 Profile\n\nBalance: `{balance}`\nVerified groups: {verified}"
+    await q.message.edit_text(text, reply_markup=main_menu())
 
-# Balance
+# -------------------------
+# Balance callback
+# -------------------------
 @dp.callback_query(lambda c: c.data == "bal")
-async def bal_cb(q: types.CallbackQuery, **kwargs):
+async def cb_balance(q: types.CallbackQuery, **kwargs):
+    ensure_user(q.from_user.id)
     user = users_col.find_one({"user_id": q.from_user.id}) or {}
     balance = user.get("balance", 0)
     await q.message.edit_text(f"💰 Balance: `{balance}`", reply_markup=main_menu())
 
-# Price view
+# -------------------------
+# Price view callback
+# -------------------------
 @dp.callback_query(lambda c: c.data == "price")
-async def price_cb(q: types.CallbackQuery, **kwargs):
+async def cb_price(q: types.CallbackQuery, **kwargs):
     price = get_price()
-    await q.message.edit_text(f"🏷 Current price for OLD group: `{price}`", reply_markup=main_menu())
+    await q.message.edit_text(f"🏷 Current price for OLD group (2016-2024): `{price}`", reply_markup=main_menu())
 
+# -------------------------
 # Admin: set price
+# -------------------------
 @dp.message(Command(commands=["price"]))
-async def admin_price_cmd(message: types.Message, **kwargs):
+async def cmd_price(message: types.Message, **kwargs):
     if message.from_user.id != ADMIN_ID:
         return await message.reply("Unauthorized")
     parts = message.text.split()
@@ -125,222 +186,247 @@ async def admin_price_cmd(message: types.Message, **kwargs):
     try:
         val = int(parts[1])
     except:
-        return await message.reply("Amount must be a number")
-    settings_col.update_one({"key": "old_price"}, {"$set": {"value": val}}, upsert=True)
+        return await message.reply("Amount must be a number.")
+    set_price(val)
     await message.reply(f"Price set to {val}")
 
-# Withdraw button pressed -> ask for address
+# -------------------------
+# Withdraw flow
+# -------------------------
 @dp.callback_query(lambda c: c.data == "wd")
-async def wd_cb(q: types.CallbackQuery, **kwargs):
+async def cb_withdraw(q: types.CallbackQuery, **kwargs):
     await q.message.edit_text("Send your crypto address (0x...):", reply_markup=back_button())
 
-# Receive address (messages starting with 0x) -> create withdraw request
-@dp.message(lambda m: m.text and m.text.strip().lower().startswith("0x"))
-async def address_msg(message: types.Message, **kwargs):
+@dp.message(lambda m: isinstance(m.text, str) and m.text.strip().lower().startswith("0x"))
+async def handle_withdraw_address(message: types.Message, **kwargs):
     ensure_user(message.from_user.id)
     user = users_col.find_one({"user_id": message.from_user.id}) or {"balance": 0}
-    amount_available = user.get("balance", 0)
-    if amount_available <= 0:
-        return await message.reply("Your balance is zero. Nothing to withdraw.")
+    balance = int(user.get("balance", 0))
+    if balance <= 0:
+        return await message.reply("Your balance is zero — nothing to withdraw.")
 
+    addr = message.text.strip()
     wd_doc = {
         "user_id": message.from_user.id,
-        "address": message.text.strip(),
+        "address": addr,
+        "amount": balance,
         "status": "pending",
-        "amount": amount_available,
         "created_at": datetime.datetime.utcnow()
     }
     res = withdraws_col.insert_one(wd_doc)
     wid = str(res.inserted_id)
 
-    # notify admin with approve/decline buttons
-    kb = types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [types.InlineKeyboardButton("✅ Approve", callback_data=f"approve:{wid}"),
-             types.InlineKeyboardButton("❌ Decline", callback_data=f"decline:{wid}")]
+    # notify admin with inline approve/decline
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton("✅ Approve", callback_data=f"approve:{wid}"),
+            types.InlineKeyboardButton("❌ Decline", callback_data=f"decline:{wid}")
         ]
-    )
-    admin_text = f"Withdraw request:\nID: {wid}\nUser: {message.from_user.id}\nAmount: {amount_available}\nAddress: {wd_doc['address']}"
+    ])
+    admin_text = f"Withdraw request:\nID: {wid}\nUser: {message.from_user.id}\nAmount: {balance}\nAddress: {addr}"
     try:
         await bot.send_message(ADMIN_ID, admin_text, reply_markup=kb)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.exception("Failed to notify admin: %s", e)
 
-    await message.reply("Withdraw request submitted. Admin will review it.")
+    await message.reply("✅ Withdraw request submitted. Admin will review it.")
 
 # Admin view pending withdraws
 @dp.message(Command("wdlist"))
-async def wdlist_cmd(message: types.Message, **kwargs):
+async def cmd_wdlist(message: types.Message, **kwargs):
     if message.from_user.id != ADMIN_ID:
         return await message.reply("Unauthorized")
     docs = list(withdraws_col.find({"status": "pending"}))
     if not docs:
         return await message.reply("No pending withdraws.")
-    text_lines = []
+    lines = []
     for d in docs:
-        text_lines.append(f"ID: {str(d['_id'])} — User: {d['user_id']} — Amount: {d.get('amount',0)} — Addr: {d['address']}")
-    await message.reply("\n".join(text_lines))
+        lines.append(f"ID: {str(d['_id'])} — User: {d['user_id']} — Amount: {d.get('amount',0)} — Addr: {d['address']}")
+    await message.reply("\n".join(lines))
 
-# Admin approve/decline callback
+# Approve / Decline callbacks
 @dp.callback_query(lambda c: c.data and (c.data.startswith("approve:") or c.data.startswith("decline:")))
-async def approve_decline_cb(q: types.CallbackQuery, **kwargs):
+async def cb_approve_decline(q: types.CallbackQuery, **kwargs):
     if q.from_user.id != ADMIN_ID:
         return await q.answer("Unauthorized", show_alert=True)
 
     data = q.data
     if data.startswith("approve:"):
         wid = data.split(":",1)[1]
-        wd = withdraws_col.find_one({"_id": ObjectId(wid)})
+        try:
+            wd = withdraws_col.find_one({"_id": ObjectId(wid)})
+        except Exception:
+            wd = None
         if not wd or wd.get("status") != "pending":
             return await q.answer("Request not found or already processed.", show_alert=True)
-        # Deduct balance (all amount) and mark approved
+
+        # deduct balance and mark approved
         users_col.update_one({"user_id": wd["user_id"]}, {"$inc": {"balance": -int(wd.get("amount",0))}})
         withdraws_col.update_one({"_id": ObjectId(wid)}, {"$set": {"status": "approved", "processed_at": datetime.datetime.utcnow(), "processed_by": q.from_user.id}})
-        await q.message.edit_text(q.message.text + f"\n\n✅ Approved by admin {q.from_user.id}")
-        # notify user & channel
+
+        # update admin message
         try:
-            await bot.send_message(wd["user_id"], f"✅ Your withdraw (ID {wid}) has been approved by admin. Address: {wd['address']}.")
+            await q.message.edit_text(q.message.text + f"\n\n✅ Approved by admin {q.from_user.id}")
         except Exception:
             pass
+
+        # notify user
+        try:
+            await bot.send_message(wd["user_id"], f"✅ Your withdraw (ID {wid}) approved. Address: {wd['address']}")
+        except Exception:
+            pass
+
+        # notify channel
         if CHANNEL_ID:
             try:
-                await bot.send_message(CHANNEL_ID, f"Withdraw APPROVED: user {wd['user_id']} — amount {wd.get('amount',0)} — addr {wd['address']}")
+                await bot.send_message(int(CHANNEL_ID), f"Withdraw APPROVED — user {wd['user_id']} — amount {wd.get('amount',0)} — addr {wd['address']}")
             except Exception:
                 pass
+
         return await q.answer("Approved")
 
     else:  # decline
         wid = data.split(":",1)[1]
-        wd = withdraws_col.find_one({"_id": ObjectId(wid)})
+        try:
+            wd = withdraws_col.find_one({"_id": ObjectId(wid)})
+        except Exception:
+            wd = None
         if not wd or wd.get("status") != "pending":
             return await q.answer("Request not found or already processed.", show_alert=True)
+
         withdraws_col.update_one({"_id": ObjectId(wid)}, {"$set": {"status": "declined", "processed_at": datetime.datetime.utcnow(), "processed_by": q.from_user.id}})
-        await q.message.edit_text(q.message.text + f"\n\n❌ Declined by admin {q.from_user.id}")
+        try:
+            await q.message.edit_text(q.message.text + f"\n\n❌ Declined by admin {q.from_user.id}")
+        except Exception:
+            pass
         try:
             await bot.send_message(wd["user_id"], f"❌ Your withdraw (ID {wid}) has been declined by admin.")
         except Exception:
             pass
         return await q.answer("Declined")
 
-# Support button
+# Support
 @dp.callback_query(lambda c: c.data == "sup")
-async def support_cb(q: types.CallbackQuery, **kwargs):
-    await q.message.edit_text("Support request sent to admin.", reply_markup=main_menu())
+async def cb_support(q: types.CallbackQuery, **kwargs):
+    # notify admin
     try:
-        await bot.send_message(ADMIN_ID, f"Support request from user {q.from_user.id}")
+        await bot.send_message(ADMIN_ID, f"⚠ Support request from user {q.from_user.id}")
     except Exception:
         pass
+    await q.message.edit_text("Support request sent to admin.", reply_markup=main_menu())
 
-# Back button: return to main menu
 @dp.callback_query(lambda c: c.data == "back")
-async def back_cb(q: types.CallbackQuery, **kwargs):
+async def cb_back(q: types.CallbackQuery, **kwargs):
     await q.message.edit_text("Back to menu:", reply_markup=main_menu())
 
-# ---------- Verification flow ----------
+# Admin extra commands
+@dp.message(Command("users"))
+async def cmd_users(message: types.Message, **kwargs):
+    if message.from_user.id != ADMIN_ID:
+        return await message.reply("Unauthorized")
+    total = users_col.count_documents({})
+    return await message.reply(f"Total users: {total}")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message, **kwargs):
+    if message.from_user.id != ADMIN_ID:
+        return await message.reply("Unauthorized")
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await message.reply("Usage: /broadcast <text>")
+    text = parts[1]
+    # naive broadcast; be careful with rate limits
+    users = users_col.find({})
+    count = 0
+    for u in users:
+        try:
+            await bot.send_message(int(u["user_id"]), text)
+            count += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    await message.reply(f"Broadcast sent to ~{count} users.")
+
+# ---------- Verification Flow ----------
 async def is_userbot_admin_in(entity):
-    """
-    Return True if userbot account is in admin list for the entity (channel/group).
-    """
     try:
         participants = await userbot.get_participants(entity, filter=ChannelParticipantsAdmins)
         me = await userbot.get_me()
         for p in participants:
-            # p is a User; compare id
             if getattr(p, "id", None) == getattr(me, "id", None):
                 return True
     except Exception:
         pass
     return False
 
-async def verify_group_process(caller_user_id: int, group_link: str):
-    """
-    Full verify flow:
-    - join group
-    - check creation year
-    - send "A"
-    - poll for promotion of userbot account (max timeout)
-    - on success, add balance to caller user
-    """
-    # normalize group_link: remove telegram prefixes if provided
-    link = group_link.strip()
-    # try to join
+async def verify_group_process(caller_user_id: int, group_link: str, timeout: int = 120):
+    # join
     try:
-        await userbot(JoinChannelRequest(link))
+        await userbot(JoinChannelRequest(group_link))
     except RPCError:
-        # ignore join errors
         pass
     except Exception:
-        # try sending message directly (some links may be usernames)
         try:
-            await userbot.send_message(link, "A")
+            await userbot.send_message(group_link, "A")
         except Exception:
-            await bot.send_message(caller_user_id, "❌ Could not join or message the group. Check the link.")
+            await bot.send_message(caller_user_id, "❌ Could not join or message the provided group. Check link.")
             return
 
-    # fetch entity
+    # get entity
     try:
-        entity = await userbot.get_entity(link)
+        entity = await userbot.get_entity(group_link)
     except Exception:
         await bot.send_message(caller_user_id, "❌ Invalid group link or entity not found.")
         return
 
-    # check creation date
+    # check creation date if available
     created = getattr(entity, "date", None)
     if created:
         year = created.year
         if not (2016 <= year <= 2024):
-            await bot.send_message(caller_user_id, "❌ Only OLD groups (2016–2024) are allowed.")
+            await bot.send_message(caller_user_id, "❌ Only OLD groups allowed (2016–2024).")
             return
 
-    # send signal message "A"
+    # send A message
     try:
         await userbot.send_message(entity, "A")
     except Exception:
-        # ignore if blocked
         pass
 
-    # now poll for promotion: check if userbot is admin
-    max_wait = 120  # seconds
-    interval = 5
+    # wait for owner to promote userbot
+    await bot.send_message(caller_user_id, "🔎 Waiting up to 2 minutes for owner to promote the account. Once promoted, verification will complete.")
     waited = 0
-    await bot.send_message(caller_user_id, "🔎 Waiting up to 2 minutes for the owner to promote the account. Once promoted, verification will complete.")
-    while waited < max_wait:
+    interval = 5
+    while waited < timeout:
         admin_now = await is_userbot_admin_in(entity)
         if admin_now:
-            # grant balance
             price = get_price()
-            ensure_user_doc = users_col.update_one  # alias for speed
-            users_col.update_one({"user_id": caller_user_id}, {"$inc": {"balance": price}}, upsert=True)
+            users_col.update_one({"user_id": caller_user_id}, {"$inc": {"balance": price}, "$push": {"verified_groups": group_link}}, upsert=True)
             await bot.send_message(caller_user_id, f"✅ Ownership verified! `{price}` added to your balance.")
-            # optional notify admin/channel
             if CHANNEL_ID:
                 try:
-                    await bot.send_message(CHANNEL_ID, f"Ownership verified for user {caller_user_id} for group {link}. Added {price}.")
+                    await bot.send_message(int(CHANNEL_ID), f"Ownership verified: user {caller_user_id} for group {group_link}. Added {price}.")
                 except Exception:
                     pass
             return
         await asyncio.sleep(interval)
         waited += interval
-
-    # timed out
-    await bot.send_message(caller_user_id, "⏱ Verification timed out. Owner did not promote the account within 2 minutes. Try again or ask owner to promote quickly.")
-
-# helper wrapper to match naming earlier
-def ensure_user_doc(user_id: int):
-    users_col.update_one({"user_id": user_id}, {"$setOnInsert": {"user_id": user_id, "balance": 0}}, upsert=True)
+    await bot.send_message(caller_user_id, "⏱ Verification timed out. Owner didn't promote the account within the time limit.")
 
 # /verify command
 @dp.message(Command("verify"))
-async def verify_cmd(message: types.Message, **kwargs):
+async def cmd_verify(message: types.Message, **kwargs):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         return await message.reply("Usage: /verify <group_link_or_username>\nExample: /verify t.me/examplegroup")
     link = parts[1].strip()
-    ensure_user_doc(message.from_user.id)
-    await message.reply("Starting verification. The userbot will join and send a signal message 'A'. Then owner should promote the account.")
+    ensure_user(message.from_user.id)
+    await message.reply("Starting verification — the userbot will join and send 'A'. Owner must promote the account.")
     asyncio.create_task(verify_group_process(message.from_user.id, link))
 
-# ---------- Webhook receiver ----------
+# -------------------------
+# Webhook receiver (if using webhook)
+# -------------------------
 async def telegram_webhook(request: web.Request):
     try:
         data = await request.json()
@@ -350,17 +436,23 @@ async def telegram_webhook(request: web.Request):
     await dp.feed_update(bot, update)
     return web.Response(text="ok")
 
-# ---------- Startup & Shutdown ----------
+# -------------------------
+# Startup & shutdown
+# -------------------------
 async def on_startup(app: web.Application):
     # start userbot
     try:
         await userbot.start()
+        logging.info("Userbot started")
     except Exception as e:
-        print("Userbot start error:", e)
-        # do not raise - bot can still function except verify flows
-    # set webhook
-    await bot.set_webhook(WEBHOOK_URL)
-    print("Webhook set to", WEBHOOK_URL)
+        logging.exception("Userbot start failed: %s", e)
+    # set webhook if provided
+    if WEBHOOK_URL:
+        try:
+            await bot.set_webhook(WEBHOOK_URL)
+            logging.info("Webhook set to %s", WEBHOOK_URL)
+        except Exception as e:
+            logging.exception("Failed to set webhook: %s", e)
 
 async def on_shutdown(app: web.Application):
     try:
@@ -372,16 +464,20 @@ async def on_shutdown(app: web.Application):
     except Exception:
         pass
 
-# ---------- Create aiohttp app ----------
+# -------------------------
+# App factory & run
+# -------------------------
 def create_app():
     app = web.Application()
-    # register aiogram webhook handler at /webhook
+    # register webhook receiver at /webhook
     app.router.add_post("/webhook", telegram_webhook)
+
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     return app
 
-# ---------- Run ----------
 if __name__ == "__main__":
+    # If WEBHOOK_URL provided, run as web service (Render recommended)
     app = create_app()
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    port = PORT if PORT else (10000)
+    web.run_app(app, host="0.0.0.0", port=port)
